@@ -413,6 +413,20 @@ def apply_stamp(page: fitz.Page, stamp_path: Path, stamp_bytes: bytes | None = N
     base_y = h - STAMP_H - MARGIN + STAMP_Y_OFFSET
     if "รับรองบริษัท" in pdf_name:
         base_y -= STAMP_H   # ขยับขึ้น 1 ตรา (~150pt) ไม่บัง QR Code
+    elif "ประกันสังคม" in pdf_name:
+        hits = page.search_for("ขอแสดงความนับถือ")
+        if hits:
+            anchor = max(hits, key=lambda r: r.y0)
+            sig_cy = anchor.y1 + 5 + SIGNATURE_H // 2  # center Y เดียวกับลายเซ็น
+            sz = 160  # ขนาดตราสำหรับระนาบเดียวกัน (ปรับได้)
+            bx = min(max(w - sz - MARGIN + offset_x, MARGIN), w - sz)
+            by = min(max(sig_cy - sz // 2, MARGIN), h - sz)
+            page.insert_image(fitz.Rect(bx, by, bx + sz, by + sz),
+                              stream=stamp_bytes, keep_proportion=True)
+            return
+        offset_y = 0  # fallback
+    elif page.search_for("ขอแสดงความนับถือ"):
+        offset_y = 0        # letter อื่นๆ: fixed Y
     x0 = min(max(base_x + offset_x, MARGIN), w - STAMP_W)
     y0 = min(max(base_y + offset_y, MARGIN), h - STAMP_H)
     page.insert_image(fitz.Rect(x0, y0, x0 + STAMP_W, y0 + STAMP_H),
@@ -492,9 +506,8 @@ def apply_signature(page: fitz.Page, sig_path: Path,
 
     target: fitz.Rect | None = None
     if "ประกันสังคม" in pdf_name and page_idx == 0:
-        # หนังสือชี้แจง: เส้นประเป็น text → วางใต้ "ขอแสดงความนับถือ" กึ่งกลาง
-        # ประกันสังคม page 0: center บนเส้นประ (no shift)
-        target = find_below_text(page, "ขอแสดงความนับถือ")
+        # เลื่อน sig ซ้าย 30pt สร้าง gap ~25pt จากตราประทับ (ไม่ทับกัน)
+        target = find_below_text(page, "ขอแสดงความนับถือ", x_shift=-30)
     elif "รับรองการจ้าง" in pdf_name:
         _w, _h = page.rect.width, page.rect.height
         if page_idx == 0:
