@@ -90,10 +90,10 @@ def save_config(data: dict) -> None:
 # ---------------------------------------------------------------------------
 # ค่าพารามิเตอร์สำหรับ Human-like Stamping
 # ---------------------------------------------------------------------------
-JITTER_PX: float = 20.0    # สุ่มขยับ ±20 pt รอบจุดอ้างอิง (ลดจาก 60 ไม่ให้ขึ้นทับจำนวนเงิน)
-ROTATION_MAX: float = 15.0  # สุ่มเอียง ±15 องศา
+JITTER_PX: float = 20.0    # สุ่มขยับ ±20 pt (ลดลงจาก 35 ป้องกันตราเข้าพื้นที่ฟอร์ม)
+ROTATION_MAX: float = 20.0  # สุ่มเอียง ±20 องศา (เพิ่มให้เด่นชัดขึ้น)
 OPACITY_MIN: float = 0.90   # สุ่มความเข้ม 90%–100%
-STAMP_Y_OFFSET: int = 30    # เลื่อนตราลงมาจาก base position อีก 30 pt
+STAMP_Y_OFFSET: int = 30    # ตราถูก clamp ไปที่ y≈692 (ใต้ลายเซ็น, สไตล์จดหมายไทย)
 
 SIGNATURE_W: int = 120  # ความกว้างลายเซ็น (pt)
 SIGNATURE_H: int = 60   # ความสูงลายเซ็น (pt)
@@ -399,23 +399,24 @@ def prepare_stamp_bytes(stamp_path: Path, angle: float, opacity: float) -> bytes
 # ---------------------------------------------------------------------------
 # 5b. ประทับตราที่มุมขวาล่างของหน้า พร้อม Human-like Stamping
 # ---------------------------------------------------------------------------
-def apply_stamp(page: fitz.Page, stamp_path: Path, stamp_bytes: bytes | None = None) -> None:
+def apply_stamp(page: fitz.Page, stamp_path: Path, stamp_bytes: bytes | None = None,
+                pdf_name: str = "") -> None:
     offset_x = random.uniform(-JITTER_PX, JITTER_PX)
     offset_y = random.uniform(-JITTER_PX, JITTER_PX)
-
     if stamp_bytes is None:
         angle   = random.uniform(-ROTATION_MAX, ROTATION_MAX)
         opacity = random.uniform(OPACITY_MIN, 1.0)
         stamp_bytes = prepare_stamp_bytes(stamp_path, angle, opacity)
-
     w = page.rect.width
     h = page.rect.height
     base_x = w - STAMP_W - MARGIN
     base_y = h - STAMP_H - MARGIN + STAMP_Y_OFFSET
+    if "รับรองบริษัท" in pdf_name:
+        base_y -= STAMP_H   # ขยับขึ้น 1 ตรา (~150pt) ไม่บัง QR Code
     x0 = min(max(base_x + offset_x, MARGIN), w - STAMP_W)
     y0 = min(max(base_y + offset_y, MARGIN), h - STAMP_H)
-    rect = fitz.Rect(x0, y0, x0 + STAMP_W, y0 + STAMP_H)
-    page.insert_image(rect, stream=stamp_bytes, keep_proportion=True)
+    page.insert_image(fitz.Rect(x0, y0, x0 + STAMP_W, y0 + STAMP_H),
+                      stream=stamp_bytes, keep_proportion=True)
 
 
 # ---------------------------------------------------------------------------
@@ -423,24 +424,133 @@ def apply_stamp(page: fitz.Page, stamp_path: Path, stamp_bytes: bytes | None = N
 # ---------------------------------------------------------------------------
 SIG_ROTATION_MAX: float = 5.0  # ลายเซ็นเอียงน้อยกว่าตรา ±5 องศา
 
-def apply_signature(page: fitz.Page, sig_path: Path) -> None:
+
+def find_below_text(page: fitz.Page, keyword: str, y_gap: float = 5, x_shift: float = 0) -> fitz.Rect | None:
+    """จดหมาย: วางลายเซ็นใต้ keyword กึ่งกลาง — สำหรับ 'ขอแสดงความนับถือ' ที่เส้นประเป็น text"""
+    hits = page.search_for(keyword)
+    if not hits:
+        return None
+    anchor = max(hits, key=lambda r: r.y0)
+    cx = (anchor.x0 + anchor.x1) / 2
+    sig_x0 = max(cx - SIGNATURE_W / 2 + x_shift, MARGIN)
+    sig_y0 = anchor.y1 + y_gap
+    return fitz.Rect(sig_x0, sig_y0, sig_x0 + SIGNATURE_W, sig_y0 + SIGNATURE_H)
+
+
+def find_right_of_text(page: fitz.Page, keyword: str) -> fitz.Rect | None:
+    """ฟอร์มที่เส้นประเป็น text (เช่น บต.46): วางลายเซ็นทันทีหลัง keyword ไม่หา drawing line"""
+    hits = page.search_for(keyword)
+    if not hits:
+        return None
+    anchor = max(hits, key=lambda r: r.y0)
+    sig_x0 = anchor.x1 + 20
+    sig_y0 = anchor.y1 - SIGNATURE_H // 2
+    return fitz.Rect(sig_x0, sig_y0, sig_x0 + SIGNATURE_W, sig_y0 + SIGNATURE_H)
+
+
+def find_line_near_text(page: fitz.Page, keyword: str) -> fitz.Rect | None:
+    """หาตำแหน่งเซ็นชื่อจาก keyword และเส้น/กล่องที่อยู่ใกล้เคียง"""
+    hits = page.search_for(keyword)
+    if not hits:
+        return None
+    anchor = max(hits, key=lambda r: r.y0)
+
+    best: fitz.Rect | None = None
+    best_dist = float("inf")
+    for draw in page.get_drawings():
+        r = draw["rect"]
+        if r.width < 40 or r.height > 20:
+            continue
+        if r.width > page.rect.width * 0.4:   # ข้าม form border กว้างเต็มหน้า (>40%)
+            continue
+        if r.x0 < anchor.x0 - 20:   # ข้าม table border ที่เริ่มซ้ายกว่า keyword มาก
+            continue
+        if r.x1 < anchor.x0:
+            continue
+        dist = abs(r.y0 - anchor.y1)
+        if dist < 80 and dist < best_dist:
+            best, best_dist = r, dist
+
+    if best is not None:
+        cx = (best.x0 + best.x1) / 2
+        sig_x0 = cx - SIGNATURE_W / 2
+        sig_y0 = best.y0 - SIGNATURE_H
+        return fitz.Rect(sig_x0, sig_y0, sig_x0 + SIGNATURE_W, sig_y0 + SIGNATURE_H)
+
+    # fallback สำหรับฟอร์มที่เส้นประเป็น text: วางกึ่งกลางระหว่าง keyword กับขอบขวาหน้า
+    cx = (anchor.x1 + page.rect.width * 0.85) / 2  # กึ่งกลางระหว่างหลัง keyword กับขวาของหน้า
+    sig_x0 = max(cx - SIGNATURE_W / 2, anchor.x1 + 10)
+    sig_y0 = anchor.y1 - SIGNATURE_H // 2
+    return fitz.Rect(sig_x0, sig_y0, sig_x0 + SIGNATURE_W, sig_y0 + SIGNATURE_H)
+
+
+def apply_signature(page: fitz.Page, sig_path: Path,
+                    pdf_name: str = "", page_idx: int = 0) -> None:
     angle   = random.uniform(-SIG_ROTATION_MAX, SIG_ROTATION_MAX)
     opacity = random.uniform(OPACITY_MIN, 1.0)
     sig_bytes = prepare_stamp_bytes(sig_path, angle, opacity)
 
+    target: fitz.Rect | None = None
+    if "ประกันสังคม" in pdf_name and page_idx == 0:
+        # หนังสือชี้แจง: เส้นประเป็น text → วางใต้ "ขอแสดงความนับถือ" กึ่งกลาง
+        # ประกันสังคม page 0: center บนเส้นประ (no shift)
+        target = find_below_text(page, "ขอแสดงความนับถือ")
+    elif "รับรองการจ้าง" in pdf_name:
+        _w, _h = page.rect.width, page.rect.height
+        if page_idx == 0:
+            # ---- ปรับตำแหน่งได้ที่นี่ ----
+            X_OFFSET = 5    # pt ทางขวาหลัง "ลงชื่อ" text
+            Y_OFFSET = 0    # pt ขยับขึ้น(-)/ลง(+) จาก center ของ keyword
+            SIG_W = 100     # ความกว้าง signature (pt)
+            SIG_H = 50      # ความสูง signature (pt)
+            # --------------------------------
+
+            # get_text("words") ดึงทุกคำ+coordinates — ไม่มีปัญหา encoding
+            words = page.get_text("words")  # (x0, y0, x1, y1, word, ...)
+            sig_words = [w for w in words if "Signature" in w[4] and w[1] > _h * 0.65]
+
+            if sig_words:
+                sw = max(sig_words, key=lambda w: w[1])   # bottommost "Signature"
+                _, wy0, wx1, _ = sw[0], sw[1], sw[2], sw[3]
+                # "ลงชื่อ" อยู่เหนือ "Signature" ~1 บรรทัด (7pt ถึง center)
+                # เส้นประเริ่มทางขวาของ "Signature" text ≈ ทางขวาของ "ลงชื่อ"
+                sig_cx = wx1 + X_OFFSET + SIG_W / 2    # บนเส้นประ
+                sig_cy = wy0 - SIG_H / 2 + Y_OFFSET      # sig bottom ชนบรรทัด dashes
+                if page.rotation in (90, 270):
+                    sig_cx, sig_cy = sig_cy, _w - sig_cx
+                _x0 = min(max(sig_cx - SIG_W / 2, MARGIN), _w - SIG_W)
+                _y0 = min(max(sig_cy - SIG_H / 2, MARGIN), _h - SIG_H)
+            else:
+                _x0 = _w * 0.18
+                _y0 = _h * 0.84 - SIG_H / 2
+            target = fitz.Rect(_x0, _y0, _x0 + SIG_W, _y0 + SIG_H)
+        else:
+            # บัญชีรายชื่อ page 1+: fixed position "(ลงชื่อ)___" ที่ ~83% ลงมา
+            _x0 = _w * 0.42
+            _y0 = _h * 0.83 - SIGNATURE_H // 2
+            target = fitz.Rect(_x0, _y0, _x0 + SIGNATURE_W, _y0 + SIGNATURE_H)
+    else:
+        # letter ทั่วไป: เลื่อนซ้ายนิดเพื่อหลีกตราประทับ
+        target = find_below_text(page, "ขอแสดงความนับถือ", x_shift=-20)
+
+    if target is not None:
+        page.insert_image(target, stream=sig_bytes, keep_proportion=True)
+        return
+
+    # default: ซ้ายของตราประทับ + jitter + ขยับขึ้น 20pt
     offset_x = random.uniform(-JITTER_PX, JITTER_PX)
     offset_y = random.uniform(-JITTER_PX, JITTER_PX)
-
-    w = page.rect.width
-    h = page.rect.height
+    w, h = page.rect.width, page.rect.height
     stamp_base_x = w - STAMP_W - MARGIN
     stamp_base_y = h - STAMP_H - MARGIN + STAMP_Y_OFFSET
+    if "รับรองบริษัท" in pdf_name:
+        stamp_base_y -= STAMP_H   # ขยับขึ้น 1 ตรา เหมือนกับ apply_stamp
     base_x = stamp_base_x - SIGNATURE_W - 10
-    base_y = stamp_base_y + (STAMP_H - SIGNATURE_H) // 2
+    base_y = stamp_base_y + (STAMP_H - SIGNATURE_H) // 2 - 20
     sig_x0 = min(max(base_x + offset_x, MARGIN), w - SIGNATURE_W)
     sig_y0 = min(max(base_y + offset_y, MARGIN), h - SIGNATURE_H)
-    rect = fitz.Rect(sig_x0, sig_y0, sig_x0 + SIGNATURE_W, sig_y0 + SIGNATURE_H)
-    page.insert_image(rect, stream=sig_bytes, keep_proportion=True)
+    page.insert_image(fitz.Rect(sig_x0, sig_y0, sig_x0 + SIGNATURE_W, sig_y0 + SIGNATURE_H),
+                      stream=sig_bytes, keep_proportion=True)
 
 
 
@@ -458,10 +568,11 @@ def process_pdf(pdf_path: Path, stamp_path: Path, output_dir: Path, sig_path: Pa
         doc.close()
         raise ValueError("ไฟล์ไม่มีหน้าเอกสาร (0 หน้า)")
 
-    for page in doc:
+    pdf_name = pdf_path.stem
+    for page_idx, page in enumerate(doc):
         if sig_path:
-            apply_signature(page, sig_path)
-        apply_stamp(page, stamp_path)
+            apply_signature(page, sig_path, pdf_name=pdf_name, page_idx=page_idx)
+        apply_stamp(page, stamp_path, pdf_name=pdf_name)
 
     best = doc.tobytes(deflate=True, garbage=4)
     doc.close()
